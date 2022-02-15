@@ -371,6 +371,7 @@ class TENCODER(tf.keras.Model):
 
         self.item_num = kwargs.get("item_num", None)
         self.seq_max_len = kwargs.get("seq_max_len", 100)
+        self.tgt_seq_len = kwargs.get("tgt_seq_len", 12)
         self.num_blocks = kwargs.get("num_blocks", 2)
         self.embedding_dim = kwargs.get("embedding_dim", 100)
         self.attention_dim = kwargs.get("attention_dim", 100)
@@ -378,9 +379,11 @@ class TENCODER(tf.keras.Model):
         self.conv_dims = kwargs.get("conv_dims", [100, 100])
         self.dropout_rate = kwargs.get("dropout_rate", 0.5)
         self.l2_reg = kwargs.get("l2_reg", 0.0)
+        self.predict_proba = kwargs.get("predict_proba", False)
+        self.encoder_type = kwargs.get("encoder_type", "transformer")
 
         self.item_embedding_layer = tf.keras.layers.Embedding(
-            self.item_num + 1,
+            self.item_num + 1,  # one for 0 index
             self.embedding_dim,
             name="item_embeddings",
             mask_zero=True,
@@ -395,26 +398,33 @@ class TENCODER(tf.keras.Model):
             embeddings_regularizer=tf.keras.regularizers.l2(self.l2_reg),
         )
         self.dropout_layer = tf.keras.layers.Dropout(self.dropout_rate)
-        self.encoder = Encoder(
-            self.num_blocks,
-            self.seq_max_len,
-            self.embedding_dim,
-            self.attention_dim,
-            self.attention_num_heads,
-            self.conv_dims,
-            self.dropout_rate,
-        )
+        if self.encoder_type == "transformer":
+            self.encoder = Encoder(
+                self.num_blocks,
+                self.seq_max_len,
+                self.embedding_dim,
+                self.attention_dim,
+                self.attention_num_heads,
+                self.conv_dims,
+                self.dropout_rate,
+            )
+        else:
+            self.encoder = tf.keras.layers.LSTM(
+                self.enc_units,
+                return_sequences=True,
+                return_state=True,
+                recurrent_initializer="glorot_uniform",
+            )
+
         self.mask_layer = tf.keras.layers.Masking(mask_value=0)
         self.layer_normalization = LayerNormalization(
             self.seq_max_len, self.embedding_dim, 1e-08
         )
-        self.dense1 = tf.keras.layers.Dense(self.embedding_dim, activation="relu")
-        self.dense_h = tf.keras.layers.Dense(self.embedding_dim, activation="relu")
-        self.dense_c = tf.keras.layers.Dense(self.embedding_dim, activation="relu")
-        self.decoder_lstm = tf.keras.layers.LSTM(
-            self.embedding_dim, activation="tanh", return_sequences=True
-        )
-        self.final = tf.keras.layers.Dense(self.item_num + 1, activation="linear")
+        self.linear = tf.keras.layers.Dense(self.tgt_seq_len, activation="linear")
+        if self.predict_proba:
+            self.final = tf.keras.layers.Dense(self.item_num + 1, activation="softmax")
+        else:
+            self.final = tf.keras.layers.Dense(self.item_num + 1, activation="linear")
 
     def embedding(self, input_seq):
 
@@ -445,21 +455,27 @@ class TENCODER(tf.keras.Model):
     def call(self, x, training):
 
         seq_attention = self.process_session(x, training)  # (b, s, d)
-        seq_attention = tf.reshape(
-            seq_attention,
-            [tf.shape(x)[0], self.seq_max_len * self.embedding_dim],
-        )  # (b, s*d)
-        output = self.final(seq_attention)
+        seq_attention = tf.transpose(seq_attention, perm=[0, 2, 1])  # (b, d, s)
+        seq_attention = self.linear(seq_attention)  # (b, d, s2)
+        seq_attention = tf.transpose(seq_attention, perm=[0, 2, 1])  # (b, s2, d)
+        # seq_attention = tf.reshape(
+        #     seq_attention,
+        #     [tf.shape(x)[0], self.seq_max_len * self.embedding_dim],
+        # )  # (b, s*d)
+        output = self.final(seq_attention)  # (b, s2, |V|)
 
         return output
 
     def predict(self, x):
         training = False
         seq_attention = self.process_session(x, training)  # (b, s, d)
-        seq_attention = tf.reshape(
-            seq_attention,
-            [tf.shape(x)[0], self.seq_max_len * self.embedding_dim],
-        )  # (b, s*d)
+        seq_attention = tf.transpose(seq_attention, perm=[0, 2, 1])  # (b, d, s)
+        seq_attention = self.linear(seq_attention)  # (b, d, s2)
+        seq_attention = tf.transpose(seq_attention, perm=[0, 2, 1])  # (b, s2, d)
+        # seq_attention = tf.reshape(
+        #     seq_attention,
+        #     [tf.shape(x)[0], self.seq_max_len * self.embedding_dim],
+        # )  # (b, s*d)
 
         output = self.final(seq_attention)
         return output
@@ -467,15 +483,10 @@ class TENCODER(tf.keras.Model):
     def loss_function(self, logits, labels):
         # logits: (b, s, V)
         # labels: (b, s)
-        # mask: (b, s)
-        # print(logits.shape, labels.shape)
-        # print(loss_mask.shape)
         loss_object = tf.keras.losses.SparseCategoricalCrossentropy(
-            from_logits=True, reduction=tf.keras.losses.Reduction.NONE
+            from_logits=True, reduction=tf.keras.losses.Reduction.AUTO
         )
         loss = loss_object(labels, logits)
-        loss = tf.reduce_sum(loss * loss_mask)
-
         reg_loss = tf.compat.v1.losses.get_regularization_loss()
         loss += reg_loss
         return loss

@@ -5,6 +5,7 @@ import pandas as pd
 import sys
 from tqdm import tqdm
 import tensorflow as tf
+from sklearn.model_selection import train_test_split
 
 
 def pad_seq(x, max_len):
@@ -309,11 +310,14 @@ def session_data_partition(data_dir, args):
     return train_X, train_y, val_X, val_y, test_X, test_y, item_ids
 
 
-def create_dataset(data_dir, args):
+def create_dataset_sequential(data_dir, args):
     """
     Creates train-validation-test data sets from interaction data.
     There is no notion of session/baskets and number of train,
     validation and test examples is same as the number of users.
+
+    The last item goes for validation and the previous item is in
+    testing.
 
     We want to predict the next few items (pre-decided) without
     using any negative sampling.
@@ -335,7 +339,7 @@ def create_dataset(data_dir, args):
             if ncol == 2:
                 u, i = line.rstrip().split(args.colsep)
             elif ncol == 3:
-                u, i, timestamp = line.rstrip().split(args.colsep)
+                u, i, _ = line.rstrip().split(args.colsep)
             elif ncol == 4:
                 u, i, _, _ = line.rstrip().split(args.colsep)
             else:
@@ -375,3 +379,64 @@ def create_dataset(data_dir, args):
     valid_y = np.array(valid_y)
 
     return train_X, train_y, valid_X, valid_y, test_X, usernum, itemnum
+
+
+def create_dataset(data_dir, args):
+    """
+    Creates train-validation-test data sets from interaction data.
+    Random split between train-validation based on certain percentage.
+
+    We want to predict the next few items (pre-decided) without
+    using any negative sampling.
+    """
+    inp_file = os.path.join(data_dir, args.dataset + ".txt")
+    sample = pd.read_csv(inp_file, sep=args.colsep, nrows=5)
+    ncol = sample.shape[1]
+    if ncol == 1:
+        raise ValueError("Not enough data to unpack!!")
+
+    usernum = 0
+    itemnum = 0
+    User = defaultdict(list)
+    test_X = []
+    with open(inp_file, "r") as fr:
+        for line in tqdm(fr):
+            if ncol == 2:
+                u, i = line.rstrip().split(args.colsep)
+            elif ncol == 3:
+                u, i, _ = line.rstrip().split(args.colsep)
+            elif ncol == 4:
+                u, i, _, _ = line.rstrip().split(args.colsep)
+            else:
+                raise ValueError("Unknown number of columns")
+            u = int(u)
+            i = int(i)
+            usernum = max(u, usernum)
+            itemnum = max(i, itemnum)
+            User[u].append(i)
+
+    all_X, all_y = [], []
+    for user in User:
+        nfeedback = len(User[user])
+        test_X.append(User[user])  # entire sequence, all users
+        if nfeedback < args.tgt_seq_len:
+            continue
+        else:
+            all_X.append(User[user][: -args.tgt_seq_len])
+            all_y.append(User[user][-args.tgt_seq_len :])
+
+    all_X = tf.keras.preprocessing.sequence.pad_sequences(
+        all_X, padding="pre", truncating="pre", maxlen=args.maxlen
+    )
+    test_X = tf.keras.preprocessing.sequence.pad_sequences(
+        test_X, padding="pre", truncating="pre", maxlen=args.maxlen
+    )
+
+    X_train, X_valid, y_train, y_valid = train_test_split(
+        all_X, all_y, test_size=0.20, random_state=42
+    )
+
+    y_train = np.array(y_train)
+    y_valid = np.array(y_valid)
+
+    return X_train, y_train, X_valid, y_valid, test_X, usernum, itemnum

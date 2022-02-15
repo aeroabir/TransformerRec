@@ -136,7 +136,7 @@ def evaluate_sasrec(model, sampler, num_examples, args):
 
 def evaluate(model, X, y, args):
     if args.model_name == "t-encoder":
-        bdim = 1024  # args.batch_size
+        bdim = args.test_batch_size
         num_examples = len(X)
         num_steps, rem = int(num_examples / bdim), int(num_examples % bdim)
         if rem > 0:
@@ -149,8 +149,9 @@ def evaluate(model, X, y, args):
         ):
             inp, tgt = X[start:end], y[start:end]
             logits = model.predict(inp)
-            products = tf.argmax(logits, axis=1)  # classes
+            products = tf.argmax(logits, axis=-1)  # classes
             batch_loss = loss_function(logits, tgt)
+            # batch_loss = loss_object(tgt, logits)
             all_scores.append(batch_loss)
             preds.append(products)
 
@@ -203,7 +204,7 @@ def get_prediction(model, X, args):
     Returns model prediction on the test data
     """
     if args.model_name == "t-encoder":
-        bdim = 1024  # args.batch_size
+        bdim = args.test_batch_size
         num_examples = len(X)
         num_steps, rem = int(num_examples / bdim), int(num_examples % bdim)
         if rem > 0:
@@ -265,13 +266,17 @@ parser.add_argument("--colsep", default="\t", type=str)
 parser.add_argument("--num_past_sessions", default=2, type=int)
 parser.add_argument("--num_target_items", default=1, type=int)
 parser.add_argument("--decoder_type", default="lstm", type=str)
+parser.add_argument("--mode", default="train", type=str)
+parser.add_argument("--predict_proba", default=False, type=bool)
 
 parser.add_argument("--batch_size", default=128, type=int)
+parser.add_argument("--test_batch_size", default=256, type=int)
 parser.add_argument("--lr", default=0.001, type=float)
 parser.add_argument("--maxlen", default=100, type=int)
+parser.add_argument("--tgt_seq_len", default=12, type=int)
 parser.add_argument("--hidden_units", default=50, type=int)
 parser.add_argument("--num_blocks", default=2, type=int)
-parser.add_argument("--num_epochs", default=201, type=int)
+parser.add_argument("--num_epochs", default=41, type=int)
 parser.add_argument("--num_heads", default=1, type=int)
 parser.add_argument("--dropout_rate", default=0.1, type=float)
 parser.add_argument("--l2_emb", default=0.0, type=float)
@@ -285,22 +290,26 @@ parser.add_argument("--rnn_name", default="gru", type=str)
 
 args = parser.parse_args()
 wdir = args.dataset + "_" + args.train_dir
-if not os.path.isdir(wdir):
-    os.makedirs(wdir)
-with open(os.path.join(wdir, "args.txt"), "w") as f:
-    f.write(
-        "\n".join(
-            [
-                str(k) + "," + str(v)
-                for k, v in sorted(vars(args).items(), key=lambda x: x[0])
-            ]
-        )
-    )
-f.close()
+model_path = os.path.join(wdir, "checkpoints/")
+checkpoint_dir = model_path  # './reco_training_checkpoints'
+checkpoint_prefix = os.path.join(checkpoint_dir, "ckpt")
 
-model_path = os.path.join(wdir, "model.h5")
 result_path = os.path.join(wdir, "result.pkl")
-f = open(os.path.join(wdir, "log.txt"), "w")
+
+if args.mode == "train":
+    if not os.path.isdir(wdir):
+        os.makedirs(wdir)
+    with open(os.path.join(wdir, "args.txt"), "w") as f:
+        f.write(
+            "\n".join(
+                [
+                    str(k) + "," + str(v)
+                    for k, v in sorted(vars(args).items(), key=lambda x: x[0])
+                ]
+            )
+        )
+    f.close()
+    f = open(os.path.join(wdir, "log.txt"), "w")
 
 if args.dataset == "dunhumby":
     data_dir = "/recsys_data/RecSys/dunnhumby_The-Complete-Journey/CSV"
@@ -328,6 +337,7 @@ elif args.dataset.startswith("hnm"):
     # )
     # with open(os.path.join(data_dir, args.dataset + ".pkl"), "wb") as fw:
     #     pickle.dump((train_X, train_y, val_X, val_y, test_X, usernum, itemnum), fw)
+    # print(f"Training data written in {args.dataset + '.pkl'}")
 
     with open(os.path.join(data_dir, args.dataset + ".pkl"), "rb") as fr:
         train_X, train_y, val_X, val_y, test_X, usernum, itemnum = pickle.load(fr)
@@ -508,10 +518,12 @@ elif args.model_name == "sasrec2":
 
 elif args.model_name == "t-encoder":
     print("Invoking Transformer Encoder model ... ")
-    f.write("Invoking Transformer Encoder model ... ")
+    if args.mode == "train":
+        f.write("Invoking Transformer Encoder model ... ")
     model = TENCODER(
         item_num=itemnum,
         seq_max_len=args.maxlen,
+        tgt_seq_len=args.tgt_seq_len,
         num_blocks=args.num_blocks,
         embedding_dim=args.hidden_units,
         attention_dim=args.hidden_units,
@@ -519,20 +531,28 @@ elif args.model_name == "t-encoder":
         dropout_rate=args.dropout_rate,
         conv_dims=[args.hidden_units, args.hidden_units],
         l2_reg=args.l2_emb,
+        predict_proba=args.predict_proba,
     )
     loss_object = tf.keras.losses.SparseCategoricalCrossentropy(
-        from_logits=True, reduction=tf.keras.losses.Reduction.AUTO
+        from_logits=not args.predict_proba,
+        reduction="none",  # reduction=tf.keras.losses.Reduction.AUTO
     )
 
     def loss_function(logits, labels):
-        loss = loss_object(labels, logits)
+        loss = loss_object(y_true=labels, y_pred=logits)
+        mask = tf.logical_not(
+            tf.math.equal(labels, 0)
+        )  # output 0 for y=0 else output 1
+        mask = tf.cast(mask, dtype=loss.dtype)
+        loss = mask * loss
+        loss = tf.reduce_mean(loss)
         reg_loss = tf.compat.v1.losses.get_regularization_loss()
         loss += reg_loss
         return loss
 
     train_step_signature = [
         tf.TensorSpec(shape=(None, args.maxlen), dtype=tf.int64),
-        tf.TensorSpec(shape=(None,), dtype=tf.int64),
+        tf.TensorSpec(shape=(None, args.tgt_seq_len), dtype=tf.int64),
     ]
 
     @tf.function(input_signature=train_step_signature)
@@ -569,116 +589,146 @@ def accuracy_function(real, pred):
 
 T = 0.0
 t0 = time.time()
+checkpoint = tf.train.Checkpoint(optimizer=optimizer, model=model)
 
-# try:
-best_ndcg = 0
-best_model = None
-patience = 0
-num_steps = int(num_examples / args.batch_size)
-rem = int(num_examples % args.batch_size)
-if rem > 0:
-    num_steps += 1
+if args.mode == "test":
+    # model = keras.models.load_model(model_path)
+    # model.load_weights(model_path)
+    checkpoint.restore(tf.train.latest_checkpoint(checkpoint_dir))
 
-for epoch in range(1, args.num_epochs + 1):
+    test_pred = get_prediction(model, test_X, args)
+    with open(result_path, "wb") as fw:
+        pickle.dump((test_pred), fw)
+    print(f"Test predictions are written in {result_path}")
 
-    step_loss = []
-    train_loss.reset_states()
-    start, end = 0, args.batch_size
-    for step in tqdm(
-        range(num_steps), total=num_steps, ncols=70, leave=False, unit="b"
-    ):
 
-        if args.model_name == "sasrec":
-            u, seq, pos, neg = train_sampler.next_batch()
-            # print("\nUsr:", u)
-            # print("\nSeq:", seq)
-            # print("\nPos:", pos)
-            # print("\nNeg:", neg)
-            # sys.exit("JJJ")
-            inputs, target = create_combined_dataset_sasrec(
-                u, seq, pos, neg, extra_argument
-            )
-            loss = train_step(inputs, target)
-            t_test = evaluate_sasrec(model, test_sampler, len(test_X), args)
+elif args.mode == "train":
+    best_ndcg = np.inf
+    best_model = None
+    patience = 0
+    num_steps = int(num_examples / args.batch_size)
+    rem = int(num_examples % args.batch_size)
+    if rem > 0:
+        num_steps += 1
 
-        elif args.model_name == "sasrec2":
-            if args.num_past_sessions == 1:
-                inps, tgt = train_X[start:end], train_y[start:end]
+    for epoch in range(1, args.num_epochs + 1):
+
+        step_loss = []
+        train_loss.reset_states()
+        start, end = 0, args.batch_size
+        for step in tqdm(
+            range(num_steps), total=num_steps, ncols=70, leave=False, unit="b"
+        ):
+
+            if args.model_name == "sasrec":
+                u, seq, pos, neg = train_sampler.next_batch()
+                inputs, target = create_combined_dataset_sasrec(
+                    u, seq, pos, neg, extra_argument
+                )
+                loss = train_step(inputs, target)
+                t_test = evaluate_sasrec(model, test_sampler, len(test_X), args)
+
+            elif args.model_name == "sasrec2":
+                if args.num_past_sessions == 1:
+                    inps, tgt = train_X[start:end], train_y[start:end]
+                else:
+                    inps, tgt = [x[start:end] for x in train_X], train_y[start:end]
+
+                inputs = create_combined_dataset(inps, tgt, extra_argument)
+                loss = train_step(inputs)
+
+            elif args.model_name == "t-encoder":
+                inp, tgt = train_X[start:end], train_y[start:end]
+                # logits = model(inp, training=True)
+                # print(inp.shape, tgt.shape, logits.shape)
+                loss = train_step(inp, tgt)
+                # t_valid = evaluate(model, val_X, val_y, args)
+                # test_pred = get_prediction(model, test_X, args)
+
+            step_loss.append(loss)
+            start += args.batch_size
+            end += args.batch_size
+            if end > num_examples:
+                end = num_examples
+
+        # model.save_weights(model_path)
+        # temp1 = evaluate(model, train_X, train_y, args)
+        val_perf = evaluate(model, val_X, val_y, args)
+        # print(temp1, temp2)
+        # sys.exit()
+
+        print(f"Epoch: {epoch}, Loss: {np.mean(step_loss):.3f}, {val_perf[0]:.3f}")
+        # print(
+        #     f"Epoch: {epoch}, Train Loss: {np.mean(step_loss):.3f}, {train_loss.result():.3f}"
+        # )
+        f.write(
+            f"Epoch: {epoch}, Train Loss: {np.mean(step_loss):.3f}, {train_loss.result():.3f}\n"
+        )
+        if epoch % 5 == 0:
+            t1 = time.time() - t0
+            T += t1
+            print("Evaluating...")
+            t_valid = evaluate(model, val_X, val_y, args)
+            if args.model_name == "t-encoder":
+                print(
+                    f"epoch: {epoch}, time: {T}, valid-{metric_names[0]}: {t_valid[0]:.4f}, valid-{metric_names[1]}: {t_valid[1]:.4f}"
+                )
+
             else:
-                inps, tgt = [x[start:end] for x in train_X], train_y[start:end]
+                t_test = evaluate(model, test_X, test_y, args)
+                print(
+                    f"epoch: {epoch}, time: {T}, valid-{metric_names[0]}: {t_valid[0]:.4f}, test-{metric_names[0]}: {t_test[0]:.4f})"
+                )
 
-            inputs = create_combined_dataset(inps, tgt, extra_argument)
-            loss = train_step(inputs)
+            if t_valid[0] < best_ndcg:
+                print("Performance improved ... updated the model.")
+                best_ndcg = t_valid[0]
+                checkpoint.save(file_prefix=checkpoint_prefix)
 
-        elif args.model_name == "t-encoder":
-            inp, tgt = train_X[start:end], train_y[start:end]
-            loss = train_step(inp, tgt)
-            # t_valid = evaluate(model, val_X, val_y, args)
-            # test_pred = get_prediction(model, test_X, args)
+                # best_model = model
+                # best_model.save(model_path, save_format="tf")
+                # best_model.save_weights(model_path)
+            else:
+                patience += 1
+                if patience == args.patience:
+                    print(f"Maximum patience {patience} reached ... exiting!")
 
-        step_loss.append(loss)
-        start += args.batch_size
-        end += args.batch_size
-        if end > num_examples:
-            end = num_examples
+            f.write("validation: " + str(t_valid[0]) + "\n")
+            f.flush()
+            t0 = time.time()
 
-    print(
-        f"Epoch: {epoch}, Train Loss: {np.mean(step_loss):.3f}, {train_loss.result():.3f}"
-    )
-    f.write(
-        f"Epoch: {epoch}, Train Loss: {np.mean(step_loss):.3f}, {train_loss.result():.3f}\n"
-    )
-    if epoch % 5 == 0:
-        t1 = time.time() - t0
-        T += t1
-        print("Evaluating...")
-        t_valid = evaluate(model, val_X, val_y, args)
-        if args.model_name == "t-encoder":
-            print(
-                f"epoch: {epoch}, time: {T}, valid-{metric_names[0]}: {t_valid[0]:.4f}, valid-{metric_names[1]}: {t_valid[1]:.4f}"
-            )
+    # Final validation run
+    t_valid = evaluate(model, val_X, val_y, args)
 
-        else:
-            t_test = evaluate(model, test_X, test_y, args)
-            print(
-                f"epoch: {epoch}, time: {T}, valid-{metric_names[0]}: {t_valid[0]:.4f}, test-{metric_names[0]}: {t_test[0]:.4f})"
-            )
+    if t_valid[0] < best_ndcg:
+        print("Performance improved ... updated the model.")
+        best_ndcg = t_valid[0]
+        checkpoint.save(file_prefix=checkpoint_prefix)
+        # best_model = model
+        # best_model.save(model_path, save_format="tf")
 
-        if t_valid > best_ndcg:
-            print("Performance improved ... updated the model.")
-            best_ndcg = t_valid
-            best_model = model
-            best_model.save(model_path, save_format="h5")
-        else:
-            patience += 1
-            if patience == args.patience:
-                print(f"Maximum patience {patience} reached ... exiting!")
+    if args.model_name == "t-encoder":
+        print(
+            f"epoch: {epoch}, time: {T}, valid-{metric_names[0]}: {t_valid[0]:.4f}, valid-{metric_names[1]}: {t_valid[1]:.4f}"
+        )
+        f.write(
+            f"\nepoch: {epoch}, time: {T}, valid-{metric_names[0]}: {t_valid[0]:.4f}, valid-{metric_names[1]}: {t_valid[1]:.4f}"
+        )
 
-        f.write("validation: " + str(t_valid) + "\n")
-        f.flush()
-        t0 = time.time()
+    else:
+        t_test = evaluate(model, test_X, test_y, args)
+        print(
+            f"epoch: {epoch}, time: {T}, valid-{metric_names[0]}: {t_valid[0]:.4f}, test-{metric_names[0]}: {t_test[0]:.4f})"
+        )
+        f.write(
+            f"\nepoch: {epoch}, valid-{metric_names[0]}: {t_valid[0]:.4f}, test-{metric_names[0]}: {t_test[0]:.4f})"
+        )
 
-t_valid = evaluate(model, val_X, val_y, args)
-if args.model_name == "t-encoder":
-    print(
-        f"epoch: {epoch}, time: {T}, valid-{metric_names[0]}: {t_valid[0]:.4f}, valid-{metric_names[1]}: {t_valid[1]:.4f}"
-    )
-    f.write(
-        f"\nepoch: {epoch}, time: {T}, valid-{metric_names[0]}: {t_valid[0]:.4f}, valid-{metric_names[1]}: {t_valid[1]:.4f}"
-    )
+    f.close()
 
-else:
-    t_test = evaluate(model, test_X, test_y, args)
-    print(
-        f"epoch: {epoch}, time: {T}, valid-{metric_names[0]}: {t_valid[0]:.4f}, test-{metric_names[0]}: {t_test[0]:.4f})"
-    )
-    f.write(
-        f"\nepoch: {epoch}, valid-{metric_names[0]}: {t_valid[0]:.4f}, test-{metric_names[0]}: {t_test[0]:.4f})"
-    )
-
-f.close()
-test_pred = get_prediction(model, test_X, args)
-with open(result_path, "wb") as fw:
-    pickle.dump((test_pred), fw)
-print(f"Test predictions are written in {result_path}")
-print("Done")
+    print("Evaluating test data ...")
+    test_pred = get_prediction(model, test_X, args)
+    with open(result_path, "wb") as fw:
+        pickle.dump((test_pred), fw)
+    print(f"Test predictions are written in {result_path}")
+    print("TRAINING COMPLETE.")

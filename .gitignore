@@ -10,6 +10,11 @@ data/*.pickle
 hnm*
 Beauty_*
 All_*
+*.txt
+
+networks_seq2seq_nmt.ipynb
+nmt_training_checkpoints/
+
 
 *.pkl
 .DS_Store

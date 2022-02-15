@@ -12,6 +12,14 @@ def random_neq(l, r, s):
 def sample_function(
     X, y, item_dict, batch_size, maxlen, neg_examples, result_queue, SEED
 ):
+    """
+    Sample to generate training data for seq2seq training where
+    negative samples are generated for a sequence by comparing with
+    the target sequence. Unlike SASRec the target sequence here is
+    not the shifted version of the input but an altogether new
+    sequence (coming from the next session).
+    """
+
     def sample():
 
         user = np.random.randint(0, len(X))
