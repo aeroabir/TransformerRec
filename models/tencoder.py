@@ -31,7 +31,9 @@ class MultiHeadAttention(tf.keras.layers.Layer):
         super(MultiHeadAttention, self).__init__()
         self.num_heads = num_heads
         self.attention_dim = attention_dim
-        assert attention_dim % self.num_heads == 0
+        assert (
+            attention_dim % self.num_heads == 0
+        ), f"attention_dim={attention_dim} & num_heads = {num_heads}"
         self.dropout_rate = dropout_rate
 
         self.depth = attention_dim // self.num_heads
@@ -165,7 +167,7 @@ class EncoderLayer(tf.keras.layers.Layer):
         self.seq_max_len = seq_max_len
         self.embedding_dim = embedding_dim
 
-        self.mha = MultiHeadAttention(attention_dim, num_heads, dropout_rate)
+        self.mha = MultiHeadAttention(embedding_dim, num_heads, dropout_rate)
         self.ffn = PointWiseFeedForward(conv_dims, dropout_rate)
 
         self.layernorm1 = tf.keras.layers.LayerNormalization(epsilon=1e-6)
@@ -178,23 +180,23 @@ class EncoderLayer(tf.keras.layers.Layer):
             self.seq_max_len, self.embedding_dim, 1e-08
         )
 
-    def call_(self, x, training, mask):
+    # def call_(self, x, training, mask):
 
-        attn_output = self.mha(queries=self.layer_normalization(x), keys=x)
-        attn_output = self.dropout1(attn_output, training=training)
-        out1 = self.layernorm1(x + attn_output)
+    #     attn_output = self.mha(queries=self.layer_normalization(x), keys=x)
+    #     attn_output = self.dropout1(attn_output, training=training)
+    #     out1 = self.layernorm1(x + attn_output)
 
-        # feed forward network
-        ffn_output = self.ffn(out1)  # (batch_size, input_seq_len, d_model)
-        ffn_output = self.dropout2(ffn_output, training=training)
-        out2 = self.layernorm2(
-            out1 + ffn_output
-        )  # (batch_size, input_seq_len, d_model)
+    #     # feed forward network
+    #     ffn_output = self.ffn(out1)  # (batch_size, input_seq_len, d_model)
+    #     ffn_output = self.dropout2(ffn_output, training=training)
+    #     out2 = self.layernorm2(
+    #         out1 + ffn_output
+    #     )  # (batch_size, input_seq_len, d_model)
 
-        # masking
-        out2 *= mask
+    #     # masking
+    #     out2 *= mask
 
-        return out2
+    #     return out2
 
     def call(self, x, training, mask):
 
@@ -374,57 +376,81 @@ class TENCODER(tf.keras.Model):
         self.tgt_seq_len = kwargs.get("tgt_seq_len", 12)
         self.num_blocks = kwargs.get("num_blocks", 2)
         self.embedding_dim = kwargs.get("embedding_dim", 100)
+        self.embedding_dims = kwargs.get(
+            "embedding_dims", None
+        )  # for multiple embeddings
         self.attention_dim = kwargs.get("attention_dim", 100)
         self.attention_num_heads = kwargs.get("attention_num_heads", 1)
         self.conv_dims = kwargs.get("conv_dims", [100, 100])
         self.dropout_rate = kwargs.get("dropout_rate", 0.5)
         self.l2_reg = kwargs.get("l2_reg", 0.0)
         self.predict_proba = kwargs.get("predict_proba", False)
-        self.encoder_type = kwargs.get("encoder_type", "transformer")
+        self.multi_feature = kwargs.get("multi_feature", False)
 
-        self.item_embedding_layer = tf.keras.layers.Embedding(
-            self.item_num + 1,  # one for 0 index
-            self.embedding_dim,
-            name="item_embeddings",
-            mask_zero=True,
-            embeddings_regularizer=tf.keras.regularizers.l2(self.l2_reg),
-        )
+        if self.multi_feature:
+            # multiple embeddings for different features
+            self.item_embedding_layer = []
+            self.layer_normalizers = []
+            for ii, count in enumerate(self.item_num):
+                embedding_ii = tf.keras.layers.Embedding(
+                    count + 1,
+                    self.embedding_dims[ii],
+                    name=f"item_{ii+1}_embeddings",
+                    mask_zero=True,
+                    embeddings_regularizer=tf.keras.regularizers.l2(self.l2_reg),
+                )
+                self.item_embedding_layer.append(embedding_ii)
+
+                self.layer_normalizers.append(
+                    LayerNormalization(self.seq_max_len, self.embedding_dims[ii], 1e-08)
+                )
+            target_vocab_dimension = self.item_num[0] + 1
+            self.embedding_out_dim = sum(self.embedding_dims)
+            self.conv_dims = [self.embedding_out_dim, self.embedding_out_dim]
+
+        else:
+            self.item_embedding_layer = tf.keras.layers.Embedding(
+                self.item_num + 1,  # one for 0 index
+                self.embedding_dim,
+                name="item_embeddings",
+                mask_zero=True,
+                embeddings_regularizer=tf.keras.regularizers.l2(self.l2_reg),
+            )
+            target_vocab_dimension = self.item_num + 1
+            self.embedding_out_dim = self.embedding_dim
 
         self.positional_embedding_layer = tf.keras.layers.Embedding(
             self.seq_max_len,
-            self.embedding_dim,
+            self.embedding_out_dim,
             name="positional_embeddings",
             mask_zero=False,
             embeddings_regularizer=tf.keras.regularizers.l2(self.l2_reg),
         )
+
         self.dropout_layer = tf.keras.layers.Dropout(self.dropout_rate)
-        if self.encoder_type == "transformer":
-            self.encoder = Encoder(
-                self.num_blocks,
-                self.seq_max_len,
-                self.embedding_dim,
-                self.attention_dim,
-                self.attention_num_heads,
-                self.conv_dims,
-                self.dropout_rate,
-            )
-        else:
-            self.encoder = tf.keras.layers.LSTM(
-                self.enc_units,
-                return_sequences=True,
-                return_state=True,
-                recurrent_initializer="glorot_uniform",
-            )
+        self.encoder = Encoder(
+            self.num_blocks,
+            self.seq_max_len,
+            self.embedding_out_dim,
+            self.attention_dim,
+            self.attention_num_heads,
+            self.conv_dims,
+            self.dropout_rate,
+        )
 
         self.mask_layer = tf.keras.layers.Masking(mask_value=0)
         self.layer_normalization = LayerNormalization(
-            self.seq_max_len, self.embedding_dim, 1e-08
+            self.seq_max_len, self.embedding_out_dim, 1e-08
         )
         self.linear = tf.keras.layers.Dense(self.tgt_seq_len, activation="linear")
         if self.predict_proba:
-            self.final = tf.keras.layers.Dense(self.item_num + 1, activation="softmax")
+            self.final = tf.keras.layers.Dense(
+                target_vocab_dimension, activation="softmax"
+            )
         else:
-            self.final = tf.keras.layers.Dense(self.item_num + 1, activation="linear")
+            self.final = tf.keras.layers.Dense(
+                target_vocab_dimension, activation="linear"
+            )
 
     def embedding(self, input_seq):
 
@@ -440,7 +466,32 @@ class TENCODER(tf.keras.Model):
 
         return seq_embeddings, positional_embeddings
 
+    def process_session_multi(self, input_seq, training):
+        mask = tf.expand_dims(
+            tf.cast(tf.not_equal(input_seq[:, :, 0], 0), tf.float32), -1
+        )
+
+        seq_embeddings = []
+        for ii in range(len(self.item_num)):
+            emb_ii = self.item_embedding_layer[ii](input_seq[:, :, ii])
+            emb_ii = emb_ii * (self.embedding_dims[ii] ** 0.5)
+            emb_ii = self.layer_normalizers[ii](emb_ii)
+            seq_embeddings.append(emb_ii)
+
+        seq_embeddings = tf.concat(seq_embeddings, axis=-1)
+        seq_embeddings = self.dropout_layer(seq_embeddings)
+
+        seq_embeddings *= mask
+
+        seq_attention = seq_embeddings
+        seq_attention = self.encoder(seq_attention, training, mask)
+        seq_attention = self.layer_normalization(seq_attention)  # (b, s, d)
+        return seq_attention
+
     def process_session(self, input_seq, training):
+        if self.multi_feature:
+            return self.process_session_multi(input_seq, training)
+
         mask = tf.expand_dims(tf.cast(tf.not_equal(input_seq, 0), tf.float32), -1)
         seq_embeddings, positional_embeddings = self.embedding(input_seq)
         seq_embeddings += positional_embeddings
@@ -458,12 +509,7 @@ class TENCODER(tf.keras.Model):
         seq_attention = tf.transpose(seq_attention, perm=[0, 2, 1])  # (b, d, s)
         seq_attention = self.linear(seq_attention)  # (b, d, s2)
         seq_attention = tf.transpose(seq_attention, perm=[0, 2, 1])  # (b, s2, d)
-        # seq_attention = tf.reshape(
-        #     seq_attention,
-        #     [tf.shape(x)[0], self.seq_max_len * self.embedding_dim],
-        # )  # (b, s*d)
         output = self.final(seq_attention)  # (b, s2, |V|)
-
         return output
 
     def predict(self, x):
@@ -472,10 +518,6 @@ class TENCODER(tf.keras.Model):
         seq_attention = tf.transpose(seq_attention, perm=[0, 2, 1])  # (b, d, s)
         seq_attention = self.linear(seq_attention)  # (b, d, s2)
         seq_attention = tf.transpose(seq_attention, perm=[0, 2, 1])  # (b, s2, d)
-        # seq_attention = tf.reshape(
-        #     seq_attention,
-        #     [tf.shape(x)[0], self.seq_max_len * self.embedding_dim],
-        # )  # (b, s*d)
 
         output = self.final(seq_attention)
         return output

@@ -395,6 +395,18 @@ def create_dataset(data_dir, args):
     if ncol == 1:
         raise ValueError("Not enough data to unpack!!")
 
+    num_prod_dim = ncol - 3  # other than u, i, t
+    if num_prod_dim > 0:
+        prod_dict = [{} for _ in range(num_prod_dim)]
+
+    def get_ids(elems):
+        ids = []
+        for ii, e in enumerate(elems):
+            if e not in prod_dict[ii]:
+                prod_dict[ii][e] = len(prod_dict[ii]) + 1
+            ids.append(prod_dict[ii][e])
+        return ids
+
     usernum = 0
     itemnum = 0
     User = defaultdict(list)
@@ -405,21 +417,28 @@ def create_dataset(data_dir, args):
                 u, i = line.rstrip().split(args.colsep)
             elif ncol == 3:
                 u, i, _ = line.rstrip().split(args.colsep)
-            elif ncol == 4:
-                u, i, _, _ = line.rstrip().split(args.colsep)
+            elif ncol >= 4:
+                elems = line.rstrip().split(args.colsep)
+                u, i, t = elems[0], elems[1], elems[-1]
+                pdims = elems[2:-1]
+                pids = get_ids(pdims)
+
             else:
                 raise ValueError("Unknown number of columns")
             u = int(u)
             i = int(i)
             usernum = max(u, usernum)
             itemnum = max(i, itemnum)
-            User[u].append(i)
+            if ncol >= 4:
+                User[u].append([i] + pids)
+            else:
+                User[u].append(i)
 
     all_X, all_y = [], []
     for user in User:
         nfeedback = len(User[user])
         test_X.append(User[user])  # entire sequence, all users
-        if nfeedback < args.tgt_seq_len:
+        if nfeedback < args.tgt_seq_len + 1:
             continue
         else:
             all_X.append(User[user][: -args.tgt_seq_len])
@@ -428,6 +447,13 @@ def create_dataset(data_dir, args):
     all_X = tf.keras.preprocessing.sequence.pad_sequences(
         all_X, padding="pre", truncating="pre", maxlen=args.maxlen
     )
+    if ncol >= 4:
+        all_y = np.array(all_y)
+        all_y = all_y[:, :, 0]  # we only predict the product-id
+
+        # update itemnum with all the cardinalities
+        itemnum = [itemnum] + [len(p) for p in prod_dict]
+
     test_X = tf.keras.preprocessing.sequence.pad_sequences(
         test_X, padding="pre", truncating="pre", maxlen=args.maxlen
     )
@@ -440,3 +466,46 @@ def create_dataset(data_dir, args):
     y_valid = np.array(y_valid)
 
     return X_train, y_train, X_valid, y_valid, test_X, usernum, itemnum
+
+
+def rel(true, pred):
+    return 1 if true == pred else 0
+
+
+def precision_k(actual, predicted, k) -> float:
+    actual_set = set(actual[:k])
+    predicted_set = set(predicted[:k])
+    precision_k_value = len(actual_set & predicted_set) / k
+
+    return precision_k_value
+
+
+def mAP_k(actual, predicted) -> float:
+    # actual = row['valid_true'].split() # prediction_string --> prediction list
+    # predicted = row['valid_pred'].split() # prediction_string --> prediction list
+
+    M = min(len(actual), len(predicted))
+    K = min(M, 12)
+
+    if M == 0:
+        return 0
+    else:
+        score = 0
+        for k in range(1, K + 1):
+            precision_k_value = precision_k(actual, predicted, k)
+
+            score += precision_k_value * rel(actual[k - 1], predicted[k - 1])
+        return score
+
+
+def map_batch(prediction, label):
+    """
+    label: (batch, 12)
+    prediction: (batch, 12)
+    """
+    pred = prediction.numpy()
+    label = label.numpy()
+    maps = []
+    for ii in range(prediction.shape[0]):
+        maps.append(mAP_k(label[ii, :], pred[ii, :]))
+    return np.mean(maps)
