@@ -17,6 +17,7 @@ nmt_training_checkpoints/
 
 
 *.pkl
+*.pt
 .DS_Store
 
 #Pycharm

@@ -1,6 +1,8 @@
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from tqdm import tqdm
 
 
 class Encoder(nn.Module):
@@ -376,3 +378,252 @@ class Seq2Seq(nn.Module):
         # attention = [batch size, n heads, trg len, src len]
 
         return output, attention
+
+
+class Seq2SeqMulti(nn.Module):
+    """
+    Seq2seq when multiple product attributes are present along with the
+    product name
+    """
+
+    def __init__(
+        self,
+        encoders,
+        decoder,
+        inp_hidden_dim,
+        out_hidden_dim,
+        src_pad_idx,
+        trg_pad_idx,
+        device,
+    ):
+        super().__init__()
+
+        self.encoders = encoders.to(device)
+        self.decoder = decoder
+        self.src_pad_idx = src_pad_idx
+        self.trg_pad_idx = trg_pad_idx
+        self.device = device
+        self.num_features = len(encoders)
+        self.inp_hidden_dim = inp_hidden_dim
+        self.out_hidden_dim = out_hidden_dim
+        self.linear = nn.Linear(inp_hidden_dim, out_hidden_dim)
+
+    def make_src_mask(self, src):
+
+        # src = [batch size, src len]
+
+        src_mask = (src != self.src_pad_idx).unsqueeze(1).unsqueeze(2)
+
+        # src_mask = [batch size, 1, 1, src len]
+
+        return src_mask
+
+    def make_trg_mask(self, trg):
+
+        # trg = [batch size, trg len]
+
+        trg_pad_mask = (trg != self.trg_pad_idx).unsqueeze(1).unsqueeze(2)
+
+        # trg_pad_mask = [batch size, 1, 1, trg len]
+
+        trg_len = trg.shape[1]
+
+        trg_sub_mask = torch.tril(
+            torch.ones((trg_len, trg_len), device=self.device)
+        ).bool()
+
+        # trg_sub_mask = [trg len, trg len]
+
+        trg_mask = trg_pad_mask & trg_sub_mask
+
+        # trg_mask = [batch size, 1, trg len, trg len]
+
+        return trg_mask
+
+    def forward(self, src, trg):
+
+        # src = [batch size, src len, num_attributes]
+        # trg = [batch size, trg len]
+
+        src_mask = self.make_src_mask(src[:, :, 0])
+        trg_mask = self.make_trg_mask(trg)
+
+        # src_mask = [batch size, 1, 1, src len]
+        # trg_mask = [batch size, 1, trg len, trg len]
+        # print(src_mask.shape, trg_mask.shape)
+        # enc_src = self.encoder(src, src_mask)
+        enc_src = []
+        for ii in range(self.num_features):
+            enc_src.append(self.encoders[ii](src[:, :, ii], src_mask))
+
+        enc_src = torch.cat(enc_src, dim=-1)
+        enc_src = self.linear(enc_src)
+        # enc_src = [batch size, src len, hid dim]
+
+        output, attention = self.decoder(trg, enc_src, trg_mask, src_mask)
+
+        # output = [batch size, trg len, output dim]
+        # attention = [batch size, n heads, trg len, src len]
+
+        return output, attention
+
+
+def train(model, iterator, optimizer, criterion, clip, device):
+
+    model.train()
+
+    epoch_loss = 0
+
+    for _, (src, trg) in tqdm(enumerate(iterator)):
+
+        src, trg = src.to(device), trg.to(device)
+        # make batch first
+        if src.dim() == 3:
+            src = src.permute(1, 0, 2)
+        else:
+            src = src.permute(1, 0)
+        trg = trg.permute(1, 0)
+
+        optimizer.zero_grad()
+
+        output, _ = model(src, trg[:, :-1])
+
+        # output = [batch size, trg len - 1, output dim]
+        # trg = [batch size, trg len]
+
+        output_dim = output.shape[-1]
+
+        output = output.contiguous().view(-1, output_dim)
+        trg = trg[:, 1:].contiguous().view(-1)
+
+        # output = [batch size * trg len - 1, output dim]
+        # trg = [batch size * trg len - 1]
+
+        loss = criterion(output, trg)
+
+        loss.backward()
+
+        torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
+
+        optimizer.step()
+
+        epoch_loss += loss.item()
+
+    return epoch_loss / len(iterator)
+
+
+def evaluate(model, iterator, criterion, device):
+
+    model.eval()
+
+    epoch_loss = 0
+    all_maps = []
+    with torch.no_grad():
+
+        for _, (src, trg) in tqdm(enumerate(iterator)):
+
+            src, trg = src.to(device), trg.to(device)
+
+            # make the batch dimension first
+            if src.dim() == 3:
+                src = src.permute(1, 0, 2)
+            else:
+                src = src.permute(1, 0)
+            trg = trg.permute(1, 0)
+
+            output, _ = model(src, trg[:, :-1])
+
+            # Mean Average Precision Calculation
+            prediction = torch.argmax(output, axis=-1)
+            mapr = map_batch(trg[:, 1:], prediction)
+            all_maps.append(mapr)
+
+            # output = [batch size, trg len - 1, output dim]
+            # trg = [batch size, trg len]
+
+            output_dim = output.shape[-1]
+
+            output = output.contiguous().view(-1, output_dim)
+            trg = trg[:, 1:].contiguous().view(-1)
+
+            # output = [batch size * trg len - 1, output dim]
+            # trg = [batch size * trg len - 1]
+
+            loss = criterion(output, trg)
+
+            epoch_loss += loss.item()
+
+    return epoch_loss / len(iterator), np.mean(all_maps)
+
+
+def rel(true, pred):
+    return 1 if true == pred else 0
+
+
+def precision_k(actual, predicted, k) -> float:
+    actual_set = set(actual[:k])
+    predicted_set = set(predicted[:k])
+    precision_k_value = len(actual_set & predicted_set) / k
+
+    return precision_k_value
+
+
+def mAP_k(actual, predicted) -> float:
+    # actual = row['valid_true'].split() # prediction_string --> prediction list
+    # predicted = row['valid_pred'].split() # prediction_string --> prediction list
+
+    M = min(len(actual), len(predicted))
+    K = min(M, 12)
+
+    if M == 0:
+        return 0
+    else:
+        score = 0
+        for k in range(1, K + 1):
+            precision_k_value = precision_k(actual, predicted, k)
+
+            score += precision_k_value * rel(actual[k - 1], predicted[k - 1])
+        return score
+
+
+def map_batch(label, prediction):
+    """
+    label: (batch, 12)
+    prediction: (batch, 12)
+    """
+    pred = prediction.cpu().numpy()
+    label = label.cpu().numpy()
+    maps = []
+    for ii in range(prediction.shape[0]):
+        l_ii = [x for x in label[ii, :] if x not in [0, 1, 2, 3]]
+        p_ii = [x for x in pred[ii, :] if x not in [0, 1, 2, 3]]
+        if len(p_ii) > 0:
+            maps.append(mAP_k(l_ii, p_ii))
+        else:
+            maps.append(0)
+    return np.mean(maps)
+
+
+def evaluate_map(model, iterator, device):
+
+    model.eval()
+    all_maps = []
+    with torch.no_grad():
+
+        for _, (src, trg) in tqdm(enumerate(iterator)):
+
+            src, trg = src.to(device), trg.to(device)
+            src = src.permute(1, 0)
+            trg = trg.permute(1, 0)
+
+            logits, _ = model(src, trg[:, :-1])
+
+            # output = [batch size, trg len - 1, output dim]
+            # trg = [batch size, trg len]
+
+            trg = trg[:, 1:]
+            prediction = torch.argmax(logits, axis=-1)
+            mapr = map_batch(trg, prediction)
+            all_maps.append(mapr)
+
+    return np.mean(all_maps)
