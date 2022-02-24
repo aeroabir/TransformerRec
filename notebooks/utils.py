@@ -47,18 +47,25 @@ def data_process_meta(all_seqs, tokenizer, vocab, test_flag=False):
     num_examples = len(all_seqs["prod"])
     num_prod_dim = len(all_seqs) - 1
     for ii in range(num_examples):
-        items = all_seqs["prod"][ii]
-        meta = [
-            all_seqs[kk][ii][0] for kk in range(num_prod_dim)
-        ]  # rest of the attributes for input
         if test_flag:
-            src = items[0]
-            src_tensor = torch.tensor(
-                [vocab[token] for token in tokenizer(src)], dtype=torch.long
-            )
+            items = all_seqs["prod"][ii]
+            meta = [
+                all_seqs[kk][ii] for kk in range(num_prod_dim)
+            ]  # rest of the attributes for input
+
+            src = items
+            src_tensor = torch.tensor([vocab[token] for token in src], dtype=torch.long)
             meta_tensor = torch.tensor(meta)
+            if src_tensor.dim() == 1:
+                src_tensor = torch.unsqueeze(src_tensor, 0)
+            # print(src_tensor, meta_tensor)
+            src_tensor = torch.cat([src_tensor, meta_tensor])
             data.append(src_tensor)
         else:
+            items = all_seqs["prod"][ii]
+            meta = [
+                all_seqs[kk][ii][0] for kk in range(num_prod_dim)
+            ]  # rest of the attributes for input
             src, tgt = items[0], items[1]
             src_tensor = torch.tensor([vocab[token] for token in src], dtype=torch.long)
             tgt_tensor = torch.tensor([vocab[token] for token in tgt], dtype=torch.long)
@@ -66,6 +73,22 @@ def data_process_meta(all_seqs, tokenizer, vocab, test_flag=False):
             if src_tensor.dim() == 1:
                 src_tensor = torch.unsqueeze(src_tensor, 0)
             src_tensor = torch.cat([src_tensor, meta_tensor])
+            data.append((src_tensor, tgt_tensor))
+    return data
+
+
+def data_process_no_meta(all_seqs, vocab, test_flag=False):
+    data = []
+    num_examples = len(all_seqs["prod"])
+    for ii in range(num_examples):
+        if test_flag:
+            src = all_seqs["prod"][ii]
+            src_tensor = torch.tensor([vocab[token] for token in src], dtype=torch.long)
+            data.append(src_tensor)
+        else:
+            src, tgt = all_seqs["prod"][ii]  # already tokenized
+            src_tensor = torch.tensor([vocab[token] for token in src], dtype=torch.long)
+            tgt_tensor = torch.tensor([vocab[token] for token in tgt], dtype=torch.long)
             data.append((src_tensor, tgt_tensor))
     return data
 
@@ -131,7 +154,7 @@ def write_train_file(
     pattern = "%Y-%m-%d %H:%M:%S"
     colsep = kwargs.get("colsep", "\t")
     write_session_info = kwargs.get("write_session_info", False)
-    # original_product_name = kwargs.get("original_product_name", False)
+    original_product_name = kwargs.get("original_product_name", False)
     write_product_meta = kwargs.get("write_product_meta", True)
 
     count = 0
@@ -168,7 +191,11 @@ def write_train_file(
                 items = transactions[cust]["products"][0]
                 dates = transactions[cust]["days"][0]
 
-            prods = [item_dict[ii] for ii in items]
+            if original_product_name:
+                prods = [ii for ii in items]
+            else:
+                prods = [item_dict[ii] for ii in items]
+
             epochs = [
                 int(time.mktime(time.strptime(str(date_time), pattern)))
                 for date_time in dates
@@ -209,15 +236,16 @@ def write_train_file(
 
 def get_session_data(inp_file, **kwargs):
     """
-    inp_file contains tab-separated user-product interaction data sorted with respect to time
-    Time is represented as sessions enumerated starting with 0 and all products in the same
-    session get the same session number. There could be other columns representing different
-    product related information.
+    inp_file contains tab-separated user-product interaction data sorted with
+    respect to time. Time is represented as sessions enumerated starting with
+    0 and all products in the same session get the same session number. There
+    could be other columns representing different product related information.
 
     """
     colsep = kwargs.get("colsep", "\t")
     inp_seq_len = kwargs.get("inp_seq_len", 12)
     tgt_seq_len = kwargs.get("tgt_seq_len", 12)
+    convert_to_integer = kwargs.get("convert_to_integer", True)
 
     def get_ids(elems):
         ids = []
@@ -254,7 +282,8 @@ def get_session_data(inp_file, **kwargs):
                 pdims = elems[2:-1]
                 pids = get_ids(pdims)
             u = int(u)
-            i = int(i)
+            if convert_to_integer:
+                i = int(i)
             t = int(t)
             if ncol >= 4:
                 User[u].append([i] + pids + [t])
@@ -283,6 +312,77 @@ def get_session_data(inp_file, **kwargs):
                 all_seqs[jj].append((inp_jj, tgt_jj))
 
     return all_seqs, prod_dict
+
+
+def get_session_data_test(inp_file, prod_dict, **kwargs):
+    """
+    inp_file contains tab-separated user-product interaction data sorted with
+    respect to time. Time is represented as sessions enumerated starting with
+    0 and all products in the same session get the same session number. There
+    could be other columns representing different product related information.
+
+    The input file is same as in get_session_data(), prod_dict is generated
+    by the same function and reused here.
+
+    The test data contains only the last session (and maybe one more) and no
+    target. This is for evaluation and scoring.
+
+    """
+    colsep = kwargs.get("colsep", "\t")
+    inp_seq_len = kwargs.get("inp_seq_len", 12)
+
+    def get_ids(elems):
+        ids = []
+        for ii, e in enumerate(elems):
+            ids.append(prod_dict[ii][e])
+        return ids
+
+    def break_sessions(seqs):
+        sids = sorted(list(set([x[-1] for x in seqs])))
+        temp = [[] for _ in range(len(sids))]
+        for seq in seqs:
+            temp[seq[-1]].append(seq[:-1])
+        return temp
+
+    sample = pd.read_csv(inp_file, sep=colsep, nrows=5)
+    ncol = sample.shape[1]
+
+    num_prod_dim = ncol - 3  # other than u, i, t
+    User = defaultdict(list)
+    with open(inp_file, "r") as fr:
+        for line in tqdm(fr):
+            if ncol == 3:
+                u, i, _ = line.rstrip().split(colsep)
+            elif ncol >= 4:
+                elems = line.rstrip().split(colsep)
+                u, i, t = elems[0], elems[1], elems[-1]
+                pdims = elems[2:-1]
+                pids = get_ids(pdims)
+            u = int(u)
+            i = int(i)
+            t = int(t)
+            if ncol >= 4:
+                User[u].append([i] + pids + [t])
+            else:
+                User[u].append(i)
+    print(f"Read {len(User)} user interactions")
+
+    if num_prod_dim > 0:
+        all_seqs = {k: [] for k in range(num_prod_dim)}
+        all_seqs["prod"] = []  # one more dictionary for the products
+
+    for u in User:
+        seqs = break_sessions(User[u])
+        inp = seqs[-1]
+        if len(inp) > inp_seq_len:
+            inp = inp[-inp_seq_len:]  # taking the last 12
+        inp_p = [str(ii[0]) for ii in inp]  # only the product-id
+        all_seqs["prod"].append((inp_p))
+        for jj in range(num_prod_dim):
+            inp_jj = [kk[jj + 1] for kk in inp]
+            all_seqs[jj].append((inp_jj))
+
+    return all_seqs
 
 
 def create_submission_file(

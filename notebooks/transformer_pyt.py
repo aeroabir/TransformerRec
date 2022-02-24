@@ -15,13 +15,20 @@ class Encoder(nn.Module):
         pf_dim,
         dropout,
         device,
+        pretrained=False,
+        weight=None,
+        ext_embed_dim=None,
         max_length=100,
     ):
         super().__init__()
 
         self.device = device
-
-        self.tok_embedding = nn.Embedding(input_dim, hid_dim)
+        if pretrained:
+            self.tok_embedding = nn.Sequential(
+                nn.Embedding.from_pretrained(weight), nn.Linear(ext_embed_dim, hid_dim)
+            )
+        else:
+            self.tok_embedding = nn.Embedding(input_dim, hid_dim)
         self.pos_embedding = nn.Embedding(max_length, hid_dim)
 
         self.layers = nn.ModuleList(
