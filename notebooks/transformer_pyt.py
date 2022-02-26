@@ -1,6 +1,7 @@
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from tqdm import tqdm
 
@@ -322,6 +323,25 @@ class DecoderLayer(nn.Module):
         return trg, attention
 
 
+class SimpleDecoder(nn.Module):
+    def __init__(self, output_dim, hid_dim, inp_seq_len, tgt_seq_len, dropout):
+        super().__init__()
+        self.inp_seq_len = inp_seq_len
+        self.tgt_seq_len = tgt_seq_len
+        self.linear = nn.Linear(inp_seq_len, tgt_seq_len)
+        self.final = nn.Linear(hid_dim, output_dim)
+        self.ff_layer_norm = nn.LayerNorm(hid_dim)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        x = x.permute(0, 2, 1)  # [batch size, hid dim, src len]
+        x = self.linear(x)  # [batch size, hid dim, tgt len]
+        x = x.permute(0, 2, 1)  # [batch size, tgt len, hid dim]
+        x = self.ff_layer_norm(x + self.dropout(x))
+        y = self.final(x)
+        return y, None
+
+
 class Seq2Seq(nn.Module):
     def __init__(self, encoder, decoder, src_pad_idx, trg_pad_idx, device):
         super().__init__()
@@ -475,6 +495,82 @@ class Seq2SeqMulti(nn.Module):
         return output, attention
 
 
+class Seq2Class(nn.Module):
+    """
+    No decoder, there is a fixed target sequence length and all the elements
+    are predicted simultaneously (and not feeding the prediction as input in
+    the next step).
+
+    Note: the input tensor should be of fixed length
+    """
+
+    def __init__(
+        self,
+        encoder,
+        decoder,
+        src_pad_idx,
+        device,
+    ):
+        super().__init__()
+
+        self.encoder = encoder
+        self.decoder = decoder
+        self.src_pad_idx = src_pad_idx
+        self.device = device
+        self.name = "seq2class"
+        self.inp_seq_len = decoder.inp_seq_len
+
+    def make_src_mask(self, src):
+
+        # src = [batch size, src len]
+
+        src_mask = (src != self.src_pad_idx).unsqueeze(1).unsqueeze(2)
+
+        # src_mask = [batch size, 1, 1, src len]
+
+        return src_mask
+
+    def forward(self, src, trg):
+
+        # src = [batch size, src len]
+        # trg = [batch size, trg len], not used here
+        # src sequence length cannot be variable
+        if src.shape[1] < self.inp_seq_len:
+
+            # method-1
+            # new_src = torch.zeros(
+            #     src.shape[0], self.inp_seq_len, dtype=torch.long, device=self.device
+            # )
+            # new_src[:, : src.shape[1]] = src
+            # src = new_src
+
+            # method-2
+            deficit = int(self.inp_seq_len - src.shape[1])
+            src = torch.cat(
+                (
+                    src,
+                    torch.zeros(
+                        int(src.shape[0]),
+                        deficit,
+                        dtype=torch.long,
+                        device=self.device,
+                    ),
+                ),
+                1,
+            )
+
+        src_mask = self.make_src_mask(src)
+        # src_mask = [batch size, 1, 1, src len]
+
+        enc_src = self.encoder(src, src_mask)
+        # enc_src = [batch size, src len, hid dim]
+
+        output, attention = self.decoder(enc_src)
+        # output = [batch size, trg len, output dim]
+
+        return output, attention
+
+
 def train(model, iterator, optimizer, criterion, clip, device):
 
     model.train()
@@ -490,6 +586,7 @@ def train(model, iterator, optimizer, criterion, clip, device):
         else:
             src = src.permute(1, 0)
         trg = trg.permute(1, 0)
+        trg_len = trg.shape[1]
 
         optimizer.zero_grad()
 
@@ -497,11 +594,17 @@ def train(model, iterator, optimizer, criterion, clip, device):
 
         # output = [batch size, trg len - 1, output dim]
         # trg = [batch size, trg len]
+        # print(src.shape, trg.shape, output.shape)
+
+        if model.name == "seq2class":
+            trg = trg.contiguous().view(-1)
+            # in case target length is not same as the input length
+            output = output[:, :trg_len, :]
+        else:
+            trg = trg[:, 1:].contiguous().view(-1)
 
         output_dim = output.shape[-1]
-
         output = output.contiguous().view(-1, output_dim)
-        trg = trg[:, 1:].contiguous().view(-1)
 
         # output = [batch size * trg len - 1, output dim]
         # trg = [batch size * trg len - 1]
@@ -537,6 +640,7 @@ def evaluate(model, iterator, criterion, device):
             else:
                 src = src.permute(1, 0)
             trg = trg.permute(1, 0)
+            trg_len = trg.shape[1]
 
             output, _ = model(src, trg[:, :-1])
 
@@ -548,10 +652,15 @@ def evaluate(model, iterator, criterion, device):
             # output = [batch size, trg len - 1, output dim]
             # trg = [batch size, trg len]
 
-            output_dim = output.shape[-1]
+            if model.name == "seq2class":
+                trg = trg.contiguous().view(-1)
+                # in case target length is not same as the input length
+                output = output[:, :trg_len, :]
+            else:
+                trg = trg[:, 1:].contiguous().view(-1)
 
+            output_dim = output.shape[-1]
             output = output.contiguous().view(-1, output_dim)
-            trg = trg[:, 1:].contiguous().view(-1)
 
             # output = [batch size * trg len - 1, output dim]
             # trg = [batch size * trg len - 1]
@@ -602,8 +711,8 @@ def map_batch(label, prediction):
     label = label.cpu().numpy()
     maps = []
     for ii in range(prediction.shape[0]):
-        l_ii = [x for x in label[ii, :] if x not in [0, 1, 2, 3]]
-        p_ii = [x for x in pred[ii, :] if x not in [0, 1, 2, 3]]
+        l_ii = [x for x in label[ii, :] if x not in [0, 1, 2]]
+        p_ii = [x for x in pred[ii, :] if x not in [0, 1, 2]]
         if len(p_ii) > 0:
             maps.append(mAP_k(l_ii, p_ii))
         else:

@@ -11,7 +11,9 @@ from torchtext.vocab import Vocab
 import torch
 
 
-def build_vocab_from_seqs(prod_seqs, tokenizer, index=-1):
+def build_vocab_from_seqs(
+    prod_seqs, tokenizer, extra=["<pad>", "<bos>", "<eos>", "<unk>"], index=-1
+):
     counter = Counter()
     for seq in prod_seqs:
         src, tgt = " ".join(seq[0]), " ".join(seq[1])
@@ -20,7 +22,7 @@ def build_vocab_from_seqs(prod_seqs, tokenizer, index=-1):
             counter.update(tokenizer(tgt))
         else:
             counter.update(tokenizer(seq[index]))
-    return Vocab(counter, specials=["<unk>", "<pad>", "<bos>", "<eos>"])
+    return Vocab(counter, specials=extra)
 
 
 def build_vocab_from_file(filepath, tokenizer, index=-1):
